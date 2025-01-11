@@ -1,0 +1,732 @@
+# Enable the driver, and choose between the kernel module or the ebpf probe.
+# Default value: kernel module.
+driver:
+  enabled: true
+  kind: modern_ebpf
+
+tty: true
+
+# Enable the collectors used to enrich the events with metadata.
+# Check the values.yaml file for fine-grained options.
+collectors:
+  enabled: true
+
+# We set the controller to daemonset since we have the syscalls source enabled.
+# It will ensure that every node on our cluster will be monitored by Falco.
+# Please note that the api-server will use the "k8saudit-webhook" service to send
+# audit logs to the falco instances. That means that when we have multiple instances of Falco
+# we can not predict to which instance the audit logs will be sent. When testing please check all
+# the Falco instance to make sure that at least one of them have received the audit logs.
+controller:
+  kind: daemonset
+
+falcoctl:
+  artifact:
+    install:
+      # -- Enable the init container.
+      enabled: true
+    follow:
+      # -- Enable the sidecar container.
+      enabled: true
+  config:
+    artifact:
+      install:
+        # -- List of artifacts to be installed by the falcoctl init container.
+        refs: [falco-rules:3, k8saudit-rules:0.7]
+      follow:
+        resolveDeps: true
+        # -- List of artifacts to be followed by the falcoctl sidecar container.
+        refs: [falco-rules:3, k8saudit-rules:0.7]
+
+services:
+  - name: k8saudit-webhook
+    type: NodePort
+    ports:
+      - port: 9765 # See plugin open_params
+        nodePort: 30007
+        protocol: TCP
+
+falco:
+  rules_files:
+    # - /etc/falco/falco_rules.yaml
+    # - /etc/falco/k8s_audit_rules.yaml
+    - /etc/falco/rules.d
+  plugins:
+    - name: k8saudit
+      library_path: libk8saudit.so
+      init_config:
+        ""
+        # maxEventBytes: 1048576
+        # sslCertificate: /etc/falco/falco.pem
+      open_params: "http://:9765/k8s-audit"
+    - name: json
+      library_path: libjson.so
+      init_config: ""
+  load_plugins: [k8saudit, json]
+
+
+
+customRules:
+  k8saudit-rules.yaml: |-
+    # SPDX-License-Identifier: Apache-2.0
+    #
+    # Copyright (C) 2023 The Falco Authors.
+    #
+    #
+    # Licensed under the Apache License, Version 2.0 (the "License");
+    # you may not use this file except in compliance with the License.
+    # You may obtain a copy of the License at
+    #
+    #     http://www.apache.org/licenses/LICENSE-2.0
+    #
+    # Unless required by applicable law or agreed to in writing, software
+    # distributed under the License is distributed on an "AS IS" BASIS,
+    # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    # See the License for the specific language governing permissions and
+    # limitations under the License.
+    #
+
+    - required_engine_version: 15
+
+    - required_plugin_versions:
+      - name: k8saudit
+        version: 0.7.0
+        alternatives:
+          - name: k8saudit-eks
+            version: 0.4.0
+          - name: k8saudit-gke
+            version: 0.1.0
+      - name: json
+        version: 0.7.0
+
+    # Like always_true/always_false, but works with k8s audit events
+    - macro: k8s_audit_always_true
+      condition: (jevt.rawtime exists)
+
+    - macro: k8s_audit_never_true
+      condition: (jevt.rawtime=0)
+
+    # Generally only consider audit events once the response has completed
+    - list: k8s_audit_stages
+      items: ["ResponseComplete"]
+
+    # Generally exclude users starting with "system:"
+    - macro: non_system_user
+      condition: (not ka.user.name startswith "system:")
+
+    # This macro selects the set of Audit Events used by the below rules.
+    - macro: kevt
+      condition: (jevt.value[/stage] in (k8s_audit_stages))
+
+    - macro: kevt_started
+      condition: (jevt.value[/stage]=ResponseStarted)
+
+    # If you wish to restrict activity to a specific set of users, override/append to this list.
+    # users created by kops are included
+    - list: vertical_pod_autoscaler_users
+      items: ["vpa-recommender", "vpa-updater"]
+
+    - list: allowed_k8s_users
+      items: [
+        "minikube", "minikube-user", "kubelet", "kops", "admin", "kube", "kube-proxy", "kube-apiserver-healthcheck",
+        "kubernetes-admin",
+        vertical_pod_autoscaler_users,
+        cluster-autoscaler,
+        "system:addon-manager",
+        "cloud-controller-manager",
+        "system:kube-controller-manager"
+        ]
+
+    - list: eks_allowed_k8s_users
+      items: [
+        "eks:node-manager",
+        "eks:certificate-controller",
+        "eks:fargate-scheduler",
+        "eks:k8s-metrics",
+        "eks:authenticator",
+        "eks:cluster-event-watcher",
+        "eks:nodewatcher",
+        "eks:pod-identity-mutating-webhook",
+        "eks:cloud-controller-manager",
+        "eks:vpc-resource-controller",
+        "eks:addon-manager",
+        ]
+
+    - list: k8s_audit_sensitive_mount_images
+      items: [
+        falcosecurity/falco, docker.io/falcosecurity/falco, public.ecr.aws/falcosecurity/falco,
+        docker.io/sysdig/sysdig, sysdig/sysdig,
+        gcr.io/google_containers/hyperkube,
+        gcr.io/google_containers/kube-proxy, docker.io/calico/node,
+        docker.io/rook/toolbox, docker.io/cloudnativelabs/kube-router, docker.io/consul,
+        docker.io/datadog/docker-dd-agent, docker.io/datadog/agent, docker.io/docker/ucp-agent, docker.io/gliderlabs/logspout,
+        docker.io/netdata/netdata, docker.io/google/cadvisor, docker.io/prom/node-exporter,
+        amazon/amazon-ecs-agent, prom/node-exporter, amazon/cloudwatch-agent
+      ]
+
+    - list: k8s_audit_privileged_images
+      items: [
+        falcosecurity/falco, docker.io/falcosecurity/falco, public.ecr.aws/falcosecurity/falco,
+        docker.io/calico/node, calico/node,
+        docker.io/cloudnativelabs/kube-router,
+        docker.io/docker/ucp-agent,
+        docker.io/mesosphere/mesos-slave,
+        docker.io/rook/toolbox,
+        docker.io/sysdig/sysdig,
+        gcr.io/google_containers/kube-proxy,
+        gcr.io/google-containers/startup-script,
+        gcr.io/projectcalico-org/node,
+        gke.gcr.io/kube-proxy,
+        gke.gcr.io/gke-metadata-server,
+        gke.gcr.io/netd-amd64,
+        gke.gcr.io/watcher-daemonset,
+        gcr.io/google-containers/prometheus-to-sd,
+        registry.k8s.io/ip-masq-agent-amd64,
+        registry.k8s.io/kube-proxy,
+        registry.k8s.io/prometheus-to-sd,
+        quay.io/calico/node,
+        sysdig/sysdig,
+        registry.k8s.io/dns/k8s-dns-node-cache,
+        mcr.microsoft.com/oss/kubernetes/kube-proxy
+      ]
+
+    # In a local/user rules file, you could override this macro to
+    # explicitly enumerate the container images that you want to run in
+    # your environment. In this main falco rules file, there isn't any way
+    # to know all the containers that can run, so any container is
+    # allowed, by using the always_true macro. In the overridden macro, the condition
+    # would look something like (ka.req.pod.containers.image.repository in (my-repo/my-image))
+    - macro: allowed_k8s_containers
+      condition: (k8s_audit_always_true)
+
+    - macro: response_successful
+      condition: (ka.response.code startswith 2)
+
+    - macro: kget
+      condition: ka.verb=get
+
+    - macro: kcreate
+      condition: ka.verb=create
+
+    - macro: kmodify
+      condition: (ka.verb in (create,update,patch))
+
+    - macro: kdelete
+      condition: ka.verb=delete
+
+    - macro: pod
+      condition: ka.target.resource=pods and not ka.target.subresource exists
+
+    - macro: pod_subresource
+      condition: ka.target.resource=pods and ka.target.subresource exists
+
+    - macro: deployment
+      condition: ka.target.resource=deployments
+
+    - macro: service
+      condition: ka.target.resource=services
+
+    - macro: configmap
+      condition: ka.target.resource=configmaps
+
+    - macro: namespace
+      condition: ka.target.resource=namespaces
+
+    - macro: serviceaccount
+      condition: ka.target.resource=serviceaccounts
+
+    - macro: clusterrole
+      condition: ka.target.resource=clusterroles
+
+    - macro: clusterrolebinding
+      condition: ka.target.resource=clusterrolebindings
+
+    - macro: role
+      condition: ka.target.resource=roles
+
+    - macro: rolebinding
+      condition: ka.target.resource=rolebindings
+
+    - macro: secret
+      condition: ka.target.resource=secrets
+
+    - macro: health_endpoint
+      condition: ka.uri=/healthz or ka.uri startswith /healthz?
+
+    - macro: live_endpoint
+      condition: ka.uri=/livez or ka.uri startswith /livez?
+
+    - macro: ready_endpoint
+      condition: ka.uri=/readyz or ka.uri startswith /readyz?
+
+    # START CUSTOM RULES
+
+    - macro: user_known_exec_pod_activities
+      condition: (k8s_audit_never_true)
+
+    - rule: Attach/Exec Pod
+      desc: >
+        Detect any attempt to attach/exec to a pod
+      condition: kevt_started and pod_subresource and kcreate and ka.target.subresource in (exec,attach) and not user_known_exec_pod_activities
+      output: Attach/Exec to pod (user=%ka.user.name pod=%ka.target.name resource=%ka.target.resource ns=%ka.target.namespace action=%ka.target.subresource command=%ka.uri.param[command])
+      priority: NOTICE
+      source: k8s_audit
+      tags: [k8s]
+
+    - macro: consider_activity_events
+      condition: (k8s_audit_always_true)
+
+    - macro: kactivity
+      condition: (kevt and consider_activity_events)
+
+    - rule: K8s Pod Get # our custom rule
+      desc: >
+          Detect any attempt to get a pod
+      condition: >
+        kactivity and kget 
+        and pod
+      output: Get pod (user=%ka.user.name pod=%ka.target.name resource=%ka.target.resource ns=%ka.target.namespace action=%ka.target.subresource command=%ka.uri.param[command])
+      priority: NOTICE
+      source: k8s_audit
+      tags: [k8s]
+
+    - rule: K8s Secret Get Successfully
+      desc: >
+        Detect any attempt to get a secret. Service account tokens are excluded.
+      condition: >
+        secret and kget
+        and kactivity
+        and response_successful
+      output: K8s Secret Get Successfully (user=%ka.user.name secret=%ka.target.name ns=%ka.target.namespace resource=%ka.target.resource resp=%ka.response.code decision=%ka.auth.decision reason=%ka.auth.reason)
+      priority: ERROR
+      source: k8s_audit
+      tags: [k8s]
+
+    - macro: sensitive_vol_mount
+      condition: >
+        (ka.req.pod.volumes.hostpath intersects (/proc, /var/run/docker.sock, /, /etc, /root, /var/run/crio/crio.sock, /run/containerd/containerd.sock, /home/admin, /var/lib/kubelet, /var/lib/kubelet/pki, /etc/kubernetes, /etc/kubernetes/manifests))
+
+    - rule: Create Sensitive Mount Pod
+      desc: >
+        Detect an attempt to start a pod with a volume from a sensitive host directory (i.e. /proc).
+        Exceptions are made for known trusted images.
+      condition: kevt and pod and kcreate and sensitive_vol_mount and not ka.req.pod.containers.image.repository in (k8s_audit_sensitive_mount_images)
+      output: Pod started with sensitive mount (user=%ka.user.name pod=%ka.resp.name ns=%ka.target.namespace resource=%ka.target.resource images=%ka.req.pod.containers.image volumes=%jevt.value[/requestObject/spec/volumes])
+      priority: WARNING
+      source: k8s_audit
+      tags: [k8s]
+
+    - macro: trusted_sa
+      condition: (ka.target.name in (known_sa_list, user_known_sa_list))
+
+    # Detect creating a service account in the kube-system/kube-public namespace
+    - rule: Service Account Created in Kube Namespace
+      desc: Detect any attempt to create a serviceaccount in the kube-system or kube-public namespaces
+      condition: kevt and serviceaccount and kcreate and ka.target.namespace in (kube-system, kube-public) and response_successful and not trusted_sa
+      output: Service account created in kube namespace (user=%ka.user.name serviceaccount=%ka.target.name resource=%ka.target.resource ns=%ka.target.namespace)
+      priority: WARNING
+      source: k8s_audit
+      tags: [k8s]
+
+    - macro: contains_private_credentials
+      condition: >
+        (ka.req.configmap.obj contains "aws_access_key_id" or
+         ka.req.configmap.obj contains "aws-access-key-id" or
+         ka.req.configmap.obj contains "aws_s3_access_key_id" or
+         ka.req.configmap.obj contains "aws-s3-access-key-id" or
+         ka.req.configmap.obj contains "password" or
+         ka.req.configmap.obj contains "passphrase")
+
+    - rule: Create/Modify Configmap With Private Credentials
+      desc: >
+         Detect creating/modifying a configmap containing a private credential (aws key, password, etc.)
+      condition: kevt and configmap and kmodify and contains_private_credentials
+      output: K8s configmap with private credential (user=%ka.user.name verb=%ka.verb resource=%ka.target.resource configmap=%ka.req.configmap.name)
+      priority: WARNING
+      source: k8s_audit
+      tags: [k8s]
+
+
+  syscall-rules.yaml: |-
+    # SPDX-License-Identifier: Apache-2.0
+    #
+    # Copyright (C) 2023 The Falco Authors.
+    #
+    #
+    # Licensed under the Apache License, Version 2.0 (the "License");
+    # you may not use this file except in compliance with the License.
+    # You may obtain a copy of the License at
+    #
+    #     http://www.apache.org/licenses/LICENSE-2.0
+    #
+    # Unless required by applicable law or agreed to in writing, software
+    # distributed under the License is distributed on an "AS IS" BASIS,
+    # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    # See the License for the specific language governing permissions and
+    # limitations under the License.
+    #
+
+    # Information about rules tags and fields can be found here: https://falco.org/docs/rules/#tags-for-current-falco-ruleset
+    # The initial item in the `tags` fields reflects the maturity level of the rules introduced upon the proposal https://github.com/falcosecurity/rules/blob/main/proposals/20230605-rules-adoption-management-maturity-framework.md
+    # `tags` fields also include information about the type of workload inspection (host and/or container), and Mitre Attack killchain phases and Mitre TTP code(s)
+    # Mitre Attack References:
+    # [1] https://attack.mitre.org/tactics/enterprise/
+    # [2] https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json
+
+    # Starting with version 8, the Falco engine supports exceptions.
+    # However the Falco rules file does not use them by default.
+    - required_engine_version: 0.31.0
+
+    # Currently disabled as read/write are ignored syscalls. The nearly
+    # similar open_write/open_read check for files being opened for
+    # reading/writing.
+    # - macro: write
+    #   condition: (syscall.type=write and fd.type in (file, directory))
+    # - macro: read
+    #   condition: (syscall.type=read and evt.dir=> and fd.type in (file, directory))
+
+    - macro: open_write
+      condition: (evt.type in (open,openat,openat2) and evt.is_open_write=true and fd.typechar='f' and fd.num>=0)
+
+    - macro: open_read
+      condition: (evt.type in (open,openat,openat2) and evt.is_open_read=true and fd.typechar='f' and fd.num>=0)
+
+    # Failed file open attempts, useful to detect threat actors making mistakes
+    # https://man7.org/linux/man-pages/man3/errno.3.html
+    # evt.res=ENOENT - No such file or directory
+    # evt.res=EACCESS - Permission denied
+    - macro: open_file_failed
+      condition: (evt.type in (open,openat,openat2) and fd.typechar='f' and fd.num=-1 and evt.res startswith E)
+
+    # This macro `never_true` is used as placeholder for tuning negative logical sub-expressions, for example
+    # - macro: allowed_ssh_hosts
+    #   condition: (never_true)
+    # can be used in a rules' expression with double negation `and not allowed_ssh_hosts` which effectively evaluates
+    # to true and does nothing, the perfect empty template for `logical` cases as opposed to list templates.
+    # When tuning the rule you can override the macro with something useful, e.g.
+    # - macro: allowed_ssh_hosts
+    #   condition: (evt.hostname contains xyz)
+    - macro: never_true
+      condition: (evt.num=0)
+
+    # This macro `always_true` is the flip side of the macro `never_true` and currently is commented out as
+    # it is not used. You can use it as placeholder for a positive logical sub-expression tuning template
+    # macro, e.g. `and custom_procs`, where
+    # - macro: custom_procs
+    #   condition: (always_true)
+    # later you can customize, override the macros to something like
+    # - macro: custom_procs
+    #   condition: (proc.name in (custom1, custom2, custom3))
+    # - macro: always_true
+    #   condition: (evt.num>=0)
+
+    # In some cases, such as dropped system call events, information about
+    # the process name may be missing. For some rules that really depend
+    # on the identity of the process performing an action such as opening
+    # a file, etc., we require that the process name be known.
+    # TODO: At the moment we keep the `N/A` variant for compatibility with old scap-files
+    - macro: proc_name_exists
+      condition: (not proc.name in ("<NA>","N/A"))
+
+    - macro: spawned_process
+      condition: (evt.type in (execve, execveat) and evt.dir=<)
+
+    - macro: create_symlink
+      condition: (evt.type in (symlink, symlinkat) and evt.dir=<)
+
+    - macro: create_hardlink
+      condition: (evt.type in (link, linkat) and evt.dir=<)
+
+    - macro: kernel_module_load
+      condition: (evt.type in (init_module, finit_module) and evt.dir=<)
+
+    - macro: dup
+      condition: (evt.type in (dup, dup2, dup3) and evt.dir=<)
+
+    # File categories
+    - macro: etc_dir
+      condition: (fd.name startswith /etc/)
+
+    - list: shell_binaries
+      items: [ash, bash, csh, ksh, sh, tcsh, zsh, dash]
+
+    - macro: shell_procs
+      condition: (proc.name in (shell_binaries))
+
+    # dpkg -L login | grep bin | xargs ls -ld | grep -v '^d' | awk '{print $9}' | xargs -L 1 basename | tr "\\n" ","
+    - list: login_binaries
+      items: [
+        login, systemd, '"(systemd)"', systemd-logind, su,
+        nologin, faillog, lastlog, newgrp, sg
+        ]
+
+    # dpkg -L passwd | grep bin | xargs ls -ld | grep -v '^d' | awk '{print $9}' | xargs -L 1 basename | tr "\\n" ","
+    - list: passwd_binaries
+      items: [
+        shadowconfig, grpck, pwunconv, grpconv, pwck,
+        groupmod, vipw, pwconv, useradd, newusers, cppw, chpasswd, usermod,
+        groupadd, groupdel, grpunconv, chgpasswd, userdel, chage, chsh,
+        gpasswd, chfn, expiry, passwd, vigr, cpgr, adduser, addgroup, deluser, delgroup
+        ]
+
+    # repoquery -l shadow-utils | grep bin | xargs ls -ld | grep -v '^d' |
+    #     awk '{print $9}' | xargs -L 1 basename | tr "\\n" ","
+    - list: shadowutils_binaries
+      items: [
+        chage, gpasswd, lastlog, newgrp, sg, adduser, deluser, chpasswd,
+        groupadd, groupdel, addgroup, delgroup, groupmems, groupmod, grpck, grpconv, grpunconv,
+        newusers, pwck, pwconv, pwunconv, useradd, userdel, usermod, vigr, vipw, unix_chkpwd
+        ]
+
+    - list: http_server_binaries
+      items: [nginx, httpd, httpd-foregroun, lighttpd, apache, apache2]
+
+    - list: db_server_binaries
+      items: [mysqld, postgres, sqlplus]
+
+    - list: postgres_mgmt_binaries
+      items: [pg_dumpall, pg_ctl, pg_lsclusters, pg_ctlcluster]
+
+    - list: nosql_server_binaries
+      items: [couchdb, memcached, redis-server, rabbitmq-server, mongod]
+
+    - list: gitlab_binaries
+      items: [gitlab-shell, gitlab-mon, gitlab-runner-b, git]
+
+    - macro: server_procs
+      condition: (proc.name in (http_server_binaries, db_server_binaries, docker_binaries, sshd))
+
+    # The explicit quotes are needed to avoid the - characters being
+    # interpreted by the filter expression.
+    - list: rpm_binaries
+      items: [dnf, dnf-automatic, rpm, rpmkey, yum, '"75-system-updat"', rhsmcertd-worke, rhsmcertd, subscription-ma,
+              repoquery, rpmkeys, rpmq, yum-cron, yum-config-mana, yum-debug-dump,
+              abrt-action-sav, rpmdb_stat, microdnf, rhn_check, yumdb]
+
+    - list: deb_binaries
+      items: [dpkg, dpkg-preconfigu, dpkg-reconfigur, dpkg-divert, apt, apt-get, aptitude,
+        frontend, preinst, add-apt-reposit, apt-auto-remova, apt-key,
+        apt-listchanges, unattended-upgr, apt-add-reposit, apt-cache, apt.systemd.dai
+        ]
+    - list: python_package_managers
+      items: [pip, pip3, conda]
+
+    # The truncated dpkg-preconfigu is intentional, process names are
+    # truncated at the falcosecurity-libs level.
+    - list: package_mgmt_binaries
+      items: [rpm_binaries, deb_binaries, update-alternat, gem, npm, python_package_managers, sane-utils.post, alternatives, chef-client, apk, snapd]
+
+    - macro: run_by_package_mgmt_binaries
+      condition: (proc.aname in (package_mgmt_binaries, needrestart))
+
+    # A canonical set of processes that run other programs with different
+    # privileges or as a different user.
+    - list: userexec_binaries
+      items: [sudo, su, suexec, critical-stack, dzdo]
+
+    - list: user_mgmt_binaries
+      items: [login_binaries, passwd_binaries, shadowutils_binaries]
+
+    - list: hids_binaries
+      items: [aide, aide.wrapper, update-aide.con, logcheck, syslog-summary, osqueryd, ossec-syscheckd]
+
+    - list: vpn_binaries
+      items: [openvpn]
+
+    - list: nomachine_binaries
+      items: [nxexec, nxnode.bin, nxserver.bin, nxclient.bin]
+
+    - list: mail_binaries
+      items: [
+        sendmail, sendmail-msp, postfix, procmail, exim4,
+        pickup, showq, mailq, dovecot, imap-login, imap,
+        mailmng-core, pop3-login, dovecot-lda, pop3
+        ]
+
+    - list: mail_config_binaries
+      items: [
+        update_conf, parse_mc, makemap_hash, newaliases, update_mk, update_tlsm4,
+        update_db, update_mc, ssmtp.postinst, mailq, postalias, postfix.config.,
+        postfix.config, postfix-script, postconf
+        ]
+
+    - list: sensitive_file_names
+      items: [/etc/shadow, /etc/sudoers, /etc/pam.conf, /etc/security/pwquality.conf]
+
+    - list: sensitive_directory_names
+      items: [/, /etc, /etc/, /root, /root/]
+
+    - macro: sensitive_files
+      condition: >
+        (fd.name in (sensitive_file_names) or
+          fd.directory in (/etc/sudoers.d, /etc/pam.d))
+
+    # Indicates that the process is new. Currently detected using time
+    # since process was started, using a threshold of 5 seconds.
+    - macro: proc_is_new
+      condition: (proc.duration <= 5000000000)
+
+    # Use this to test whether the event occurred within a container.
+    # When displaying container information in the output field, use
+    # %container.info, without any leading term (file=%fd.name
+    # %container.info user=%user.name user_loginuid=%user.loginuid, and not file=%fd.name
+    # container=%container.info user=%user.name user_loginuid=%user.loginuid). The output will change
+    # based on the context and whether or not -pk/-pm/-pc was specified on
+    # the command line.
+    - macro: container
+      condition: (container.id != host)
+
+    - macro: interactive
+      condition: >
+        ((proc.aname=sshd and proc.name != sshd) or
+        proc.name=systemd-logind or proc.name=login)
+
+    - list: cron_binaries
+      items: [anacron, cron, crond, crontab]
+
+    # https://github.com/liske/needrestart
+    - list: needrestart_binaries
+      items: [needrestart, 10-dpkg, 20-rpm, 30-pacman]
+
+    # Possible scripts run by sshkit
+    - list: sshkit_script_binaries
+      items: [10_etc_sudoers., 10_passwd_group]
+
+    # System users that should never log into a system. Consider adding your own
+    # service users (e.g. 'apache' or 'mysqld') here.
+    - macro: system_users
+      condition: (user.name in (bin, daemon, games, lp, mail, nobody, sshd, sync, uucp, www-data))
+
+    - macro: ansible_running_python
+      condition: (proc.name in (python, pypy, python3) and proc.cmdline contains ansible)
+
+    # Qualys seems to run a variety of shell subprocesses, at various
+    # levels. This checks at a few levels without the cost of a full
+    # proc.aname, which traverses the full parent hierarchy.
+    - macro: run_by_qualys
+      condition: >
+        (proc.pname=qualys-cloud-ag or
+         proc.aname[2]=qualys-cloud-ag or
+         proc.aname[3]=qualys-cloud-ag or
+         proc.aname[4]=qualys-cloud-ag)
+
+    - macro: run_by_google_accounts_daemon
+      condition: >
+        (proc.aname[1] startswith google_accounts or
+         proc.aname[2] startswith google_accounts or
+         proc.aname[3] startswith google_accounts)
+
+    # Chef is similar.
+    - macro: run_by_chef
+      condition: (proc.aname[2]=chef_command_wr or proc.aname[3]=chef_command_wr or
+                  proc.aname[2]=chef-client or proc.aname[3]=chef-client or
+                  proc.name=chef-client)
+
+    # Also handles running semi-indirectly via scl
+    - macro: run_by_foreman
+      condition: >
+        (user.name=foreman and
+         ((proc.pname in (rake, ruby, scl) and proc.aname[5] in (tfm-rake,tfm-ruby)) or
+         (proc.pname=scl and proc.aname[2] in (tfm-rake,tfm-ruby))))
+
+    - macro: python_mesos_marathon_scripting
+      condition: (proc.pcmdline startswith "python3 /marathon-lb/marathon_lb.py")
+
+    - macro: splunk_running_forwarder
+      condition: (proc.pname=splunkd and proc.cmdline startswith "sh -c /opt/splunkforwarder")
+
+    - macro: perl_running_plesk
+      condition: (proc.cmdline startswith "perl /opt/psa/admin/bin/plesk_agent_manager" or
+                  proc.pcmdline startswith "perl /opt/psa/admin/bin/plesk_agent_manager")
+
+    - macro: perl_running_updmap
+      condition: (proc.cmdline startswith "perl /usr/bin/updmap")
+
+    - macro: perl_running_centrifydc
+      condition: (proc.cmdline startswith "perl /usr/share/centrifydc")
+
+    - macro: runuser_reading_pam
+      condition: (proc.name=runuser and fd.directory=/etc/pam.d)
+
+    # CIS Linux Benchmark program
+    - macro: linux_bench_reading_etc_shadow
+      condition: ((proc.aname[2]=linux-bench and
+                   proc.name in (awk,cut,grep)) and
+                  (fd.name=/etc/shadow or
+                   fd.directory=/etc/pam.d))
+
+    - macro: veritas_driver_script
+      condition: (proc.cmdline startswith "perl /opt/VRTSsfmh/bin/mh_driver.pl")
+
+    - macro: user_ssh_directory
+      condition: (fd.name contains '/.ssh/' and fd.name glob '/home/*/.ssh/*')
+
+    - macro: directory_traversal
+      condition: (fd.nameraw contains '../' and fd.nameraw glob '*../*../*')
+
+    # ******************************************************************************
+    # START CUSTOM RULES
+    # ******************************************************************************
+        # In a local/user rules file, create a condition that matches legitimate uses
+    # of a package management process inside a container.
+    #
+    # For example:
+    # - macro: user_known_package_manager_in_container
+    #   condition: proc.cmdline="dpkg -l"
+
+    - macro: user_known_package_manager_in_container
+      condition: (never_true)
+
+    # Container is supposed to be immutable. Package management should be done in building the image.
+    - macro: pkg_mgmt_in_kube_proxy
+      condition: >
+        (proc.cmdline startswith "update-alternat"
+        and container.image.repository = "registry.k8s.io/kube-proxy")
+
+    - list: package_mgmt_binaries
+      items: [rpm_binaries, deb_binaries, update-alternat, gem, npm, python_package_managers, sane-utils.post, alternatives, chef-client, apk, snapd]
+
+    - macro: package_mgmt_procs
+      condition: (proc.name in (package_mgmt_binaries))
+
+    - macro: package_mgmt_ancestor_procs
+      condition: (proc.pname in (package_mgmt_binaries) or
+                 proc.aname[2] in (package_mgmt_binaries) or
+                 proc.aname[3] in (package_mgmt_binaries) or
+                 proc.aname[4] in (package_mgmt_binaries))
+
+    - rule: Launch Package Management Process in Container
+      desc: > 
+        Detect package management processes executed within containers. An excellent auditing rule to monitor general drifts 
+        in containers. Particularly useful for newer rules like "Drop and execute new binary in container" during incident 
+        response investigations. This helps identify common anti-patterns of ad-hoc debugging. Simultaneously, to maintain 
+        optimal hygiene, it's recommended to prevent container drifts and instead opt for redeploying new containers.
+      condition: >
+        spawned_process
+        and container
+        and user.name != "_apt"
+        and package_mgmt_procs
+        and not package_mgmt_ancestor_procs
+        and not user_known_package_manager_in_container
+        and not pkg_mgmt_in_kube_proxy
+      output: Package management process launched in container (evt_type=%evt.type user=%user.name user_uid=%user.uid user_loginuid=%user.loginuid process=%proc.name proc_exepath=%proc.exepath parent=%proc.pname command=%proc.cmdline terminal=%proc.tty exe_flags=%evt.arg.flags %container.info)
+      priority: ERROR
+      tags: [maturity_incubating, container, process, software_mgmt, mitre_persistence, T1505]
+
+
+    - list: user_known_packet_socket_binaries
+      items: []
+
+    - rule: Packet socket created in container
+      desc: > 
+        Detect new packet socket at the device driver (OSI Layer 2) level in a container. Packet socket could be used for ARP Spoofing 
+        and privilege escalation (CVE-2020-14386) by an attacker. Noise can be reduced by using the user_known_packet_socket_binaries
+        template list.
+      condition: > 
+        evt.type=socket and evt.dir=>
+        and container 
+        and evt.arg.domain contains AF_PACKET 
+        and not proc.name in (user_known_packet_socket_binaries)
+      output: Packet socket was created in a container (socket_info=%evt.args connection=%fd.name lport=%fd.lport rport=%fd.rport fd_type=%fd.type fd_proto=%fd.l4proto evt_type=%evt.type user=%user.name user_uid=%user.uid user_loginuid=%user.loginuid process=%proc.name proc_exepath=%proc.exepath parent=%proc.pname command=%proc.cmdline terminal=%proc.tty %container.info)
+      priority: NOTICE
+      tags: [maturity_stable, container, network, mitre_credential_access, T1557.002]
