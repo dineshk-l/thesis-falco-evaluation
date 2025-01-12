@@ -1,1 +1,17 @@
-# thesis-falco-evaluation
+# Thesis Repository
+
+This repository contains configurations to accompany my thesis. It includes modified Helm values for Falco, a Pod configuration with a HostPath volume, and a Secret configuration. Please refer to the thesis for more information.
+
+## Repository Contents
+
+1. **Helm Values for Falco**
+   - These can be used when installing Falco. The documentation (https://falco.org/docs/getting-started/learning-environments/#falco-with-multiple-sources) makes use of a Helm values file provided by Falco (https://raw.githubusercontent.com/falcosecurity/charts/master/charts/falco/values-syscall-k8saudit.yaml), and we modify this to exclude loading default rules and load our custom selected rules instead (in addition to the overrides specified in the documentation (`--set driver.kind=modern_ebpf` and `--set tty=true`).
+   - File: `falco-helm-values.yaml`
+
+2. **Pod Configuration with HostPath**
+   - A Pod configuration that mounts a sensitive directory using `hostPath` to simulate generating the respective alert. It can be applied using `kubectl apply -f hostpath-pod.yaml`. Note: This varies from the listing in the thesis. 
+   - File: `hostpath-pod.yaml`
+
+3. **Secret Configuration**
+   - A Kubernetes Secret configuration to simulate scenarios where Falco can detect sensitive access to secrets. It can be applied using `kubectl apply -f secretconfig.yaml`.
+   - File: `secret-config.yaml`
